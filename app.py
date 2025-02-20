@@ -1,244 +1,268 @@
 import streamlit as st
 import cv2
 import numpy as np
-import re
 import io
+from PIL import Image, ExifTags
 
-# ================================================
-#         HELPER FUNCTIONS (Image I/O)
-# ================================================
-def load_grayscale_image_from_bytes(uploaded_file):
-    """Load an image from a stream as grayscale (float32)."""
-    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-    img = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        st.error(f"Failed to load image: {uploaded_file.name}")
-    # Reset file pointer for future use if needed.
-    uploaded_file.seek(0)
-    return img.astype(np.float32)
+# ------------------------------
+#   Image & Metadata Utilities
+# ------------------------------
+def load_image_and_data(uploaded_file, grayscale=True):
+    """
+    Aggressively load an image from an uploaded file.
+    Returns the OpenCV image (as float32) and raw byte data.
+    """
+    data = uploaded_file.getvalue()
+    file_array = np.frombuffer(data, np.uint8)
+    flag = cv2.IMREAD_GRAYSCALE if grayscale else cv2.IMREAD_COLOR
+    image = cv2.imdecode(file_array, flag)
+    if image is None:
+        st.error(f"⚠️ Could not load image: {uploaded_file.name}")
+    return image.astype(np.float32), data
 
-def convert_cv2_to_bytes(image):
-    """Convert a CV2 image (grayscale or BGR) to PNG bytes."""
-    ret, buf = cv2.imencode('.png', image)
+def extract_exposure(image_bytes):
+    """
+    Extract exposure time from image metadata using PIL.
+    Falls back to 1.0 if unavailable.
+    """
+    try:
+        pil_img = Image.open(io.BytesIO(image_bytes))
+        exif = pil_img._getexif()
+        if exif:
+            for tag, value in exif.items():
+                tag_name = ExifTags.TAGS.get(tag, tag)
+                if tag_name == "ExposureTime":
+                    if isinstance(value, tuple) and value[1] != 0:
+                        return value[0] / value[1]
+                    else:
+                        return float(value)
+        return 1.0
+    except Exception:
+        return 1.0
+
+def image_to_bytes(image):
+    """Convert an OpenCV image to PNG bytes for downloads."""
+    success, buf = cv2.imencode('.png', image)
     return buf.tobytes()
 
-# ================================================
-#         PROCESSING HELPER FUNCTIONS
-# ================================================
-def get_exposure_time(filename):
-    """Extract exposure time from filename (e.g., 'uv_0.5s.png')."""
-    match = re.search(r'uv_([\d.]+)s', filename)
-    if match:
-        return float(match.group(1))
-    raise ValueError(f"Exposure time not found in filename: {filename}")
+# ------------------------------
+#        Processing Helpers
+# ------------------------------
+def create_default_mask(shape):
+    """Generate a full-white mask for given dimensions."""
+    return np.ones(shape, dtype=np.uint8) * 255
 
-def load_mask_and_bbox(mask_image):
+def compute_bbox(mask):
     """
-    Given a grayscale mask image (float32), threshold it,
-    then compute and return the binary mask, bounding box, and boolean mask.
+    Compute bounding box (ymin, ymax, xmin, xmax) from a binary mask.
     """
-    _, mask_bin = cv2.threshold(mask_image, 127, 255, cv2.THRESH_BINARY)
-    mask_bool = mask_bin > 0
+    mask_bool = mask > 0
     ys, xs = np.where(mask_bool)
     if ys.size == 0 or xs.size == 0:
-        raise ValueError("Mask has no non-zero pixels!")
-    bbox = (ys.min(), ys.max(), xs.min(), xs.max())
-    return mask_bool, bbox, mask_bin
+        raise ValueError("No non-zero pixels found in mask!")
+    return (ys.min(), ys.max(), xs.min(), xs.max())
 
-def crop_to_bbox(image, bbox):
-    """Crop an image to the bounding box (ymin, ymax, xmin, xmax)."""
+def crop_image(image, bbox):
+    """Crop an image using the bounding box coordinates."""
     ymin, ymax, xmin, xmax = bbox
     return image[ymin:ymax+1, xmin:xmax+1]
 
-def normalize_by_exposure(image, exposure_time):
-    """Divide the image by its exposure time."""
-    if exposure_time == 0:
-        raise ValueError("Exposure time is zero!")
-    return image / exposure_time
-
-def normalize_intensity_map(image, epsilon=1e-6):
+def normalize(image, epsilon=1e-6):
     """Normalize image intensities to the [0,1] range."""
     min_val, max_val = image.min(), image.max()
     if max_val - min_val < epsilon:
         return np.zeros_like(image)
     return (image - min_val) / (max_val - min_val)
 
-def refine_inverse_mask_super_smooth(mask, blur_iterations=50, kernel_size=51):
+def smooth_mask(diff_img, iterations=30, kernel_size=41):
     """
-    Refine the mask to be super smooth (with no visible contours)
-    by applying a morphological closing followed by many iterations of Gaussian blur.
+    Aggressively smooth the difference image to generate a refined mask.
     """
-    # Convert to 8-bit image.
-    mask_uint8 = np.uint8(np.clip(mask * 255.0, 0, 255))
+    mask_8bit = np.uint8(np.clip(diff_img * 255.0, 0, 255))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    closed = cv2.morphologyEx(mask_uint8, cv2.MORPH_CLOSE, kernel)
-    smoothed = closed.copy()
-    for i in range(blur_iterations):
-        smoothed = cv2.GaussianBlur(smoothed, (kernel_size, kernel_size), 0)
-    refined = smoothed.astype(np.float32) / 255.0
-    return normalize_intensity_map(refined)
+    closed = cv2.morphologyEx(mask_8bit, cv2.MORPH_CLOSE, kernel)
+    smooth = closed.copy()
+    for _ in range(iterations):
+        smooth = cv2.GaussianBlur(smooth, (kernel_size, kernel_size), 0)
+    refined = smooth.astype(np.float32) / 255.0
+    return normalize(refined)
 
-# ================================================
-#           PROCESSING PIPELINE FUNCTION
-# ================================================
-def process_pipeline(ref_image, mask_image, uv_files, params):
-    results = {}  # Dictionary to hold all outputs
+# ------------------------------
+#         Processing Pipeline
+# ------------------------------
+def process_pipeline(ref_file, mask_file, uv_files, params):
+    results = {}
 
-    # 1. Reference Image is already loaded.
-    results['reference'] = ref_image
+    # Load Reference Image
+    ref_img, ref_data = load_image_and_data(ref_file, grayscale=True)
+    results['Reference'] = normalize(ref_img)
 
-    # 2. Process Mask and extract bounding box.
-    mask_bool, bbox, mask_bin = load_mask_and_bbox(mask_image)
-    results['mask'] = mask_bin
-    results['bbox'] = bbox
+    # Load Mask Image (or create default if missing)
+    if mask_file:
+        mask_img, _ = load_image_and_data(mask_file, grayscale=True)
+    else:
+        mask_img = create_default_mask(ref_img.shape)
+    results['Mask'] = mask_img
 
-    # 3. Crop the reference image to the ROI defined by the mask.
-    ref_cropped = crop_to_bbox(ref_image, bbox)
-    results['cropped_reference'] = ref_cropped
+    # Compute bounding box from mask and crop reference image
+    try:
+        bbox = compute_bbox(mask_img)
+    except Exception as e:
+        st.error("Error computing bounding box: " + str(e))
+        return None
+    results['BoundingBox'] = bbox
+    ref_crop = crop_image(ref_img, bbox)
+    results['CroppedReference'] = normalize(ref_crop)
 
-    # 4. Process each UV image.
-    diff_maps = []
-    uv_details = []  # To store each UV's cropped and diff results.
-    for uv_file in uv_files:
+    # Process each UV image
+    uv_diffs = []
+    uv_details = []
+    for uv in uv_files:
         try:
-            uv_image = load_grayscale_image_from_bytes(uv_file)
-            exposure_time = get_exposure_time(uv_file.name)
-            norm_uv = normalize_by_exposure(uv_image, exposure_time)
-            uv_cropped = crop_to_bbox(norm_uv, bbox)
-            diff = cv2.absdiff(uv_cropped, ref_cropped)
-            diff = diff * params['DIFF_SCALE_FACTOR']
-            diff = normalize_intensity_map(diff, epsilon=params['EPSILON'])
-            diff_maps.append(diff)
+            uv_img, uv_data = load_image_and_data(uv, grayscale=True)
+            exposure = extract_exposure(uv_data)
+            norm_uv = uv_img / exposure if exposure != 0 else uv_img
+            uv_crop = crop_image(norm_uv, bbox)
+            diff = cv2.absdiff(uv_crop, ref_crop)
+            diff = diff * params['scale']
+            diff = normalize(diff, epsilon=params['epsilon'])
+            uv_diffs.append(diff)
             uv_details.append({
-                'name': uv_file.name,
-                'uv_cropped': uv_cropped,
-                'diff': diff
+                'name': uv.name,
+                'CroppedUV': normalize(uv_crop),
+                'Difference': diff
             })
         except Exception as e:
-            st.error(f"Error processing {uv_file.name}: {e}")
-    results['uv_details'] = uv_details
+            st.error(f"Error processing {uv.name}: {e}")
+    results['UV_Details'] = uv_details
 
-    if not diff_maps:
-        st.error("No UV images processed.")
+    if not uv_diffs:
+        st.error("No valid UV images processed.")
         return None
 
-    # 5. Combine the difference maps (average).
-    combined_diff = np.mean(np.stack(diff_maps), axis=0)
-    results['combined_diff'] = combined_diff
+    # Combine differences and generate refined masks
+    combined_diff = np.mean(np.stack(uv_diffs), axis=0)
+    results['CombinedDifference'] = normalize(combined_diff)
+    refined = smooth_mask(combined_diff, iterations=params['iterations'], kernel_size=params['ksize'])
+    results['RefinedMask'] = refined
+    inverse_mask = (1.0 - refined / 1.5) / 3
+    results['InverseMask'] = normalize(inverse_mask)
 
-    # 6. Create refined mask and its inverse.
-    refined_mask = refine_inverse_mask_super_smooth(
-        combined_diff,
-        blur_iterations=params['blur_iterations'],
-        kernel_size=params['kernel_size']
-    )
-    results['refined_mask'] = refined_mask
-    inverse_mask_refined = (1.0 - refined_mask / 1.5) / 3
-    results['inverse_mask_refined'] = inverse_mask_refined
-
-    # 7. Create final output masks.
-    cropped_mask = np.uint8(normalize_intensity_map(inverse_mask_refined) * 255)
-    results['final_cropped_mask'] = cropped_mask
-
-    full_mask = np.zeros_like(ref_image, dtype=np.float32)
+    # Create final output masks
+    final_cropped = np.uint8(normalize(inverse_mask) * 255)
+    results['FinalCroppedMask'] = final_cropped
+    full_mask = np.zeros_like(ref_img, dtype=np.float32)
     ymin, ymax, xmin, xmax = bbox
-    full_mask[ymin:ymax+1, xmin:xmax+1] = inverse_mask_refined
-    final_uncropped_mask = np.uint8(normalize_intensity_map(full_mask) * 255)
-    results['final_uncropped_mask'] = final_uncropped_mask
+    full_mask[ymin:ymax+1, xmin:xmax+1] = inverse_mask
+    final_full = np.uint8(normalize(full_mask) * 255)
+    results['FinalFullMask'] = final_full
 
     return results
 
-# ================================================
-#           STREAMLIT UI IMPLEMENTATION
-# ================================================
-st.set_page_config(page_title="UV Uniformity Tool", layout="wide")
-st.title("UV Uniformity Full Detail Tool")
-st.write("This tool processes your images to analyze UV uniformity with full control over each parameter and displays every intermediate step.")
+# ------------------------------
+#         Streamlit UI
+# ------------------------------
+st.set_page_config(page_title="Aggressive UV Mask Maker", layout="wide")
+st.title("Aggressive UV Mask Maker 🚀")
+st.write("Generate ultra-customized mask images for UV exposure in resin 3D printing. Adjust parameters, inspect every step, and download your outputs.")
 
-# ---- Sidebar for file uploads and parameters ----
-st.sidebar.header("Upload Your Files")
-ref_file = st.sidebar.file_uploader("Reference Image (e.g., reference.png)", type=["png", "jpg", "jpeg"])
-mask_file = st.sidebar.file_uploader("Mask Image (e.g., mask.png)", type=["png", "jpg", "jpeg"])
-uv_files = st.sidebar.file_uploader("UV Images (e.g., uv_0.5s.png)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+# Sidebar: Uploads & Parameters
+st.sidebar.header("Upload Your Images")
+ref_upload = st.sidebar.file_uploader("Reference Image", type=["png", "jpg", "jpeg"])
+mask_upload = st.sidebar.file_uploader("Mask Image (Optional)", type=["png", "jpg", "jpeg"])
+uv_uploads = st.sidebar.file_uploader("UV Images", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 
-st.sidebar.header("Parameters")
-diff_scale = st.sidebar.slider("DIFF_SCALE_FACTOR", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
-epsilon_val = st.sidebar.number_input("EPSILON", value=1e-6, format="%.7f")
-blur_iterations = st.sidebar.slider("Blur Iterations", min_value=1, max_value=100, value=30, step=1)
-kernel_size = st.sidebar.slider("Kernel Size (odd numbers)", min_value=3, max_value=101, value=41, step=2)
-save_intermediate = st.sidebar.checkbox("Show Intermediate Steps", value=True)
+st.sidebar.header("Processing Parameters")
+scale = st.sidebar.slider("Difference Scale Factor", 0.1, 10.0, 1.0, step=0.1)
+epsilon = st.sidebar.number_input("Normalization Epsilon", value=1e-6, format="%.7f")
+iterations = st.sidebar.slider("Smoothing Iterations", 1, 100, 30, step=1)
+ksize = st.sidebar.slider("Kernel Size (Odd)", 3, 101, 41, step=2)
 
 params = {
-    'DIFF_SCALE_FACTOR': diff_scale,
-    'EPSILON': epsilon_val,
-    'blur_iterations': blur_iterations,
-    'kernel_size': kernel_size,
-    'SAVE_INTERMEDIATE': save_intermediate
+    'scale': scale,
+    'epsilon': epsilon,
+    'iterations': iterations,
+    'ksize': ksize
 }
 
-# ---- Process Button ----
 if st.sidebar.button("Process Images"):
-    if not ref_file or not mask_file or not uv_files:
-        st.error("Please upload all required images: Reference, Mask, and at least one UV image.")
+    if not ref_upload or not uv_uploads:
+        st.error("Please upload at least a Reference Image and one UV Image.")
     else:
-        with st.spinner("Processing..."):
-            try:
-                # Load reference and mask images.
-                ref_image = load_grayscale_image_from_bytes(ref_file)
-                mask_image = load_grayscale_image_from_bytes(mask_file)
-                
-                # Run processing pipeline.
-                results = process_pipeline(ref_image, mask_image, uv_files, params)
-                if results is None:
-                    st.error("Processing failed.")
-                else:
-                    st.success("Processing complete!")
-                    
-                    # --------------------------
-                    # Display Intermediate Results
-                    # --------------------------
-                    st.header("Intermediate Steps")
-                    
-                    with st.expander("1. Reference Image"):
-                        st.image(normalize_intensity_map(results['reference']), caption="Reference Image", use_column_width=True)
-                    
-                    with st.expander("2. Mask and Bounding Box"):
-                        st.image(results['mask'], caption="Binary Mask", use_column_width=True)
-                        bbox = results['bbox']
-                        st.write(f"Bounding Box: (ymin: {bbox[0]}, ymax: {bbox[1]}, xmin: {bbox[2]}, xmax: {bbox[3]})")
-                    
-                    with st.expander("3. Cropped Reference Image"):
-                        st.image(normalize_intensity_map(results['cropped_reference']), caption="Cropped Reference", use_column_width=True)
-                    
-                    with st.expander("4. UV Images & Their Difference Maps"):
-                        for uv in results['uv_details']:
-                            st.subheader(uv['name'])
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                st.image(normalize_intensity_map(uv['uv_cropped']), caption="Cropped UV", use_column_width=True)
-                            with col2:
-                                st.image(uv['diff'], caption="Difference Map", use_column_width=True)
-                    
-                    with st.expander("5. Combined Difference Map"):
-                        st.image(normalize_intensity_map(results['combined_diff']), caption="Combined Difference", use_column_width=True)
-                    
-                    with st.expander("6. Refined Mask and Inverse Mask"):
-                        st.image(results['refined_mask'], caption="Refined Mask", use_column_width=True)
-                        st.image(normalize_intensity_map(results['inverse_mask_refined']), caption="Inverse Refined Mask", use_column_width=True)
-                    
-                    # --------------------------
-                    # Display Final Outputs
-                    # --------------------------
-                    st.header("Final Outputs")
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.image(results['final_cropped_mask'], caption="Final Cropped Mask", use_column_width=True)
-                        png_bytes = convert_cv2_to_bytes(results['final_cropped_mask'])
-                        st.download_button(label="Download Cropped Mask", data=png_bytes, file_name="output_mask_cropped.png", mime="image/png")
-                    with col2:
-                        st.image(results['final_uncropped_mask'], caption="Final Uncropped Mask", use_column_width=True)
-                        png_bytes2 = convert_cv2_to_bytes(results['final_uncropped_mask'])
-                        st.download_button(label="Download Uncropped Mask", data=png_bytes2, file_name="output_mask_uncropped.png", mime="image/png")
-                    
-            except Exception as e:
-                st.error(f"An error occurred during processing: {e}")
+        with st.spinner("Processing images aggressively..."):
+            output = process_pipeline(ref_upload, mask_upload, uv_uploads, params)
+        if output:
+            st.success("Processing complete!")
+            
+            # Display Intermediate Steps
+            st.header("Intermediate Steps")
+            col_ref, col_mask = st.columns(2)
+            with col_ref:
+                st.subheader("Reference")
+                st.image(output['Reference'], caption="Normalized Reference", use_column_width=True)
+            with col_mask:
+                st.subheader("Mask")
+                st.image(output['Mask'], caption="Mask (or Default)", use_column_width=True)
+            
+            st.subheader("Bounding Box")
+            st.write(f"Coordinates: {output['BoundingBox']}")
+            
+            st.subheader("Cropped Reference")
+            st.image(output['CroppedReference'], caption="Cropped Reference", use_column_width=True)
+            
+            st.subheader("UV Details & Differences")
+            for uv in output['UV_Details']:
+                st.markdown(f"**{uv['name']}**")
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.image(uv['CroppedUV'], caption="Cropped UV", use_column_width=True)
+                with c2:
+                    st.image(uv['Difference'], caption="Difference Map", use_column_width=True)
+            
+            st.subheader("Combined Difference")
+            st.image(output['CombinedDifference'], caption="Combined Difference", use_column_width=True)
+            
+            st.subheader("Refined & Inverse Masks")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.image(output['RefinedMask'], caption="Refined Mask", use_column_width=True)
+            with c2:
+                st.image(output['InverseMask'], caption="Inverse Mask", use_column_width=True)
+            
+            # Final Outputs
+            st.header("Final Outputs")
+            final_cropped = output['FinalCroppedMask']
+            final_full = output['FinalFullMask']
+            c1, c2 = st.columns(2)
+            with c1:
+                st.image(final_cropped, caption="Final Cropped Mask", use_column_width=True)
+                st.download_button("Download Cropped Mask", data=image_to_bytes(final_cropped), file_name="final_cropped_mask.png", mime="image/png")
+            with c2:
+                st.image(final_full, caption="Final Full Mask", use_column_width=True)
+                st.download_button("Download Full Mask", data=image_to_bytes(final_full), file_name="final_full_mask.png", mime="image/png")
+            # 🔥 Final Outputs - Ready to Deploy 🔥
+            st.header("🚀 Final Mask Outputs")
+
+            col_final1, col_final2 = st.columns(2)
+
+            with col_final1:
+                st.image(final_cropped, caption="🟢 Final Cropped Mask", use_column_width=True)
+                st.download_button(
+                    label="📥 Download Cropped Mask",
+                    data=image_to_bytes(final_cropped),
+                    file_name="final_cropped_mask.png",
+                    mime="image/png"
+                )
+
+            with col_final2:
+                st.image(final_full, caption="🔵 Final Full Mask", use_column_width=True)
+                st.download_button(
+                    label="📥 Download Full Mask",
+                    data=image_to_bytes(final_full),
+                    file_name="final_full_mask.png",
+                    mime="image/png"
+                )
+
+            # 🎯 Final Message
+            st.success("🔥 Your customized UV mask is READY! Print like a pro. 🖨️✨")
+
