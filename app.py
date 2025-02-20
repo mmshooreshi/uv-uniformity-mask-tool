@@ -166,11 +166,26 @@ st.set_page_config(page_title="Aggressive UV Mask Maker", layout="wide")
 st.title("Aggressive UV Mask Maker 🚀")
 st.write("Generate ultra-customized mask images for UV exposure in resin 3D printing. Adjust parameters, inspect every step, and download your outputs.")
 
-# Sidebar: Uploads & Parameters
+# ------------------------------
+# Sidebar: Uploads, Example Loader & Parameters
+# ------------------------------
+import io
+
+def load_example_file(path):
+    with open(path, "rb") as f:
+        return io.BytesIO(f.read())
+
 st.sidebar.header("Upload Your Images")
 ref_upload = st.sidebar.file_uploader("Reference Image", type=["png", "jpg", "jpeg"])
 mask_upload = st.sidebar.file_uploader("Mask Image (Optional)", type=["png", "jpg", "jpeg"])
 uv_uploads = st.sidebar.file_uploader("UV Images", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+
+# Button: Load Default Example Images from 'assets' directory
+if st.sidebar.button("Load Example Images (Default)"):
+    ref_upload = load_example_file("assets/reference.png")
+    mask_upload = load_example_file("assets/mask.png")
+    uv_uploads = [load_example_file("assets/uv_0.004000s_358.png")]
+    st.sidebar.success("Example images loaded!")
 
 st.sidebar.header("Processing Parameters")
 scale = st.sidebar.slider("Difference Scale Factor", 0.1, 10.0, 1.0, step=0.1)
@@ -185,84 +200,79 @@ params = {
     'ksize': ksize
 }
 
+# ------------------------------
+# Process Images Button
+# ------------------------------
 if st.sidebar.button("Process Images"):
     if not ref_upload or not uv_uploads:
-        st.error("Please upload at least a Reference Image and one UV Image.")
+        st.error("Please upload at least a Reference Image and one UV Image (or load example images).")
     else:
         with st.spinner("Processing images aggressively..."):
             output = process_pipeline(ref_upload, mask_upload, uv_uploads, params)
         if output:
             st.success("Processing complete!")
             
+            # ------------------------------
             # Display Intermediate Steps
+            # ------------------------------
             st.header("Intermediate Steps")
+            
             col_ref, col_mask = st.columns(2)
             with col_ref:
                 st.subheader("Reference")
-                st.image(output['Reference'], caption="Normalized Reference", use_column_width=True)
+                st.image(output['Reference'], caption="Normalized Reference", use_container_width=True)
             with col_mask:
                 st.subheader("Mask")
-                st.image(output['Mask'], caption="Mask (or Default)", use_column_width=True)
+                st.image(output['Mask'], caption="Mask (or Default)", use_container_width=True)
             
             st.subheader("Bounding Box")
             st.write(f"Coordinates: {output['BoundingBox']}")
             
             st.subheader("Cropped Reference")
-            st.image(output['CroppedReference'], caption="Cropped Reference", use_column_width=True)
+            st.image(output['CroppedReference'], caption="Cropped Reference", use_container_width=True)
             
             st.subheader("UV Details & Differences")
             for uv in output['UV_Details']:
                 st.markdown(f"**{uv['name']}**")
                 c1, c2 = st.columns(2)
                 with c1:
-                    st.image(uv['CroppedUV'], caption="Cropped UV", use_column_width=True)
+                    st.image(uv['CroppedUV'], caption="Cropped UV", use_container_width=True)
                 with c2:
-                    st.image(uv['Difference'], caption="Difference Map", use_column_width=True)
+                    st.image(uv['Difference'], caption="Difference Map", use_container_width=True)
             
             st.subheader("Combined Difference")
-            st.image(output['CombinedDifference'], caption="Combined Difference", use_column_width=True)
+            st.image(output['CombinedDifference'], caption="Combined Difference", use_container_width=True)
             
             st.subheader("Refined & Inverse Masks")
             c1, c2 = st.columns(2)
             with c1:
-                st.image(output['RefinedMask'], caption="Refined Mask", use_column_width=True)
+                st.image(output['RefinedMask'], caption="Refined Mask", use_container_width=True)
             with c2:
-                st.image(output['InverseMask'], caption="Inverse Mask", use_column_width=True)
+                st.image(output['InverseMask'], caption="Inverse Mask", use_container_width=True)
             
+            # ------------------------------
             # Final Outputs
-            st.header("Final Outputs")
+            # ------------------------------
+            st.header("🚀 Final Mask Outputs")
             final_cropped = output['FinalCroppedMask']
             final_full = output['FinalFullMask']
-            c1, c2 = st.columns(2)
-            with c1:
-                st.image(final_cropped, caption="Final Cropped Mask", use_column_width=True)
-                st.download_button("Download Cropped Mask", data=image_to_bytes(final_cropped), file_name="final_cropped_mask.png", mime="image/png")
-            with c2:
-                st.image(final_full, caption="Final Full Mask", use_column_width=True)
-                st.download_button("Download Full Mask", data=image_to_bytes(final_full), file_name="final_full_mask.png", mime="image/png")
-            # 🔥 Final Outputs - Ready to Deploy 🔥
-            st.header("🚀 Final Mask Outputs")
-
+            
             col_final1, col_final2 = st.columns(2)
-
             with col_final1:
-                st.image(final_cropped, caption="🟢 Final Cropped Mask", use_column_width=True)
+                st.image(final_cropped, caption="🟢 Final Cropped Mask", use_container_width=True)
                 st.download_button(
                     label="📥 Download Cropped Mask",
                     data=image_to_bytes(final_cropped),
                     file_name="final_cropped_mask.png",
                     mime="image/png"
                 )
-
             with col_final2:
-                st.image(final_full, caption="🔵 Final Full Mask", use_column_width=True)
+                st.image(final_full, caption="🔵 Final Full Mask", use_container_width=True)
                 st.download_button(
                     label="📥 Download Full Mask",
                     data=image_to_bytes(final_full),
                     file_name="final_full_mask.png",
                     mime="image/png"
                 )
-
-            # 🎯 Final Message
+            
             st.success("🔥 Your customized UV mask is READY! Print like a pro. 🖨️✨")
-
