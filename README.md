@@ -53,14 +53,14 @@
 
 ## Pipeline Overview
 ```mermaid
-flowchart LR
-    A[Upload Files (Reference, Mask, UV Images)]
-    B[Preprocess: Convert to Grayscale & Normalize]
-    C[Extract Mask & Crop with Bounding Box]
-    D[Compute Difference Maps for UV Images]
-    E[Combine & Smooth the Difference Maps]
-    F[Generate Final Mask Outputs]
-    
+flowchart TD
+    A(["🔥 DROP FILES: Reference, Mask, & UV Images"])
+    B(["⚡ PREPROCESS: Convert to Grayscale & Normalize"])
+    C(["🎯 MASK EXTRACTION: Pinpoint ROI & Crop Like a Boss"])
+    D(["💥 DIFFERENCE STRIKE: Compute UV Image Discrepancies"])
+    E(["🔥 SMOOTHING OVERDRIVE: Merge & Refine with Laser Precision"])
+    F(["🚀 FINAL MASK: Unleash Ultimate UV Exposure"])
+
     A --> B
     B --> C
     C --> D
