@@ -11,7 +11,6 @@
 - [Features](#features)
 - [Quickstart](#quickstart)
 - [Pipeline Overview](#pipeline-overview)
-- [Visual Preview](#visual-preview)
 - [Contributing](#contributing)
 - [License](#license)
 - [Contact](#contact)
@@ -68,12 +67,7 @@ flowchart TD
     E --> F
 ```
 
----
-
-## Visual Preview
 ![UV Mask Process](https://cdn2.sculpteo.com/blog/wp-content/uploads/2016/08/SLA-Formlabs-compressed.gif)
-
----
 
 ## Contributing
 Contributions are welcome! Please see [CONTRIBUTING.md](./CONTRIBUTING.md) for details on how to get started.
