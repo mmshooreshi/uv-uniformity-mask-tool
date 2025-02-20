@@ -71,7 +71,7 @@ flowchart TD
 ---
 
 ## Visual Preview
-![UV Mask Process](https://media.giphy.com/media/sltXBTQh2ogIFYwNNk/giphy.gif)
+![UV Mask Process](https://cdn2.sculpteo.com/blog/wp-content/uploads/2016/08/SLA-Formlabs-compressed.gif)
 
 ---
 
